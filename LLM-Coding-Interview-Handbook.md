@@ -55,10 +55,18 @@ $$
 
 #### （A）PyTorch 版本
 
-<span style="color:red">**`dim=0` 是最外层；`dim=-1` 是最里面那一层。** </span>
+<span style="color:red">**`dim=0` 是最外层；`dim=-1` 是最里面那一层。**</span>
+
+以 attention scores 为例：shape 是 `(B, H, Tq, Tk)`——`B` batch，`H` head，`Tq` query 位置，**最后一维 `Tk` 是 key 位置**。因此 `softmax(scores, dim=-1)` 是对每个 query 沿全部 key 归一化（每行和为 1）。自注意力时常写成 `(B,H,T,T)`，那只是 `Tq=Tk=T` 的特例。
 
 
 **① Softmax**
+
+$$
+\text{softmax}(x)_i = \frac{e^{x_i - \max(x)}}{\sum_j e^{x_j - \max(x)}}
+$$
+
+代码对应：减 `max` → `exp` → 沿 `dim` 求和再除。
 
 ```python
 import torch
@@ -72,7 +80,16 @@ def softmax(x, dim=-1):
 
 **② Cross-Entropy（多分类，logits + class index）**
 
+$$
+L_{\text{CE}}^{\text{multi}}
+= -\frac{1}{N}\sum_{n=1}^{N}
+\log \frac{e^{z_{n,y_n}}}{\sum_c e^{z_{n,c}}}
+= -\frac{1}{N}\sum_{n=1}^{N}
+\big(z_{n,y_n} - \operatorname{logsumexp}_c(z_{n,c})\big),
+\quad z=\text{logits}
+$$
 
+代码对应：`logits - logsumexp` 得 log-softmax，再取目标类下标求均值。
 
 ```python
 def cross_entropy(logits, targets):
@@ -84,6 +101,12 @@ def cross_entropy(logits, targets):
 
 **③ BCE（二分类）**
 
+$$
+L_{\text{CE}}^{\text{bin}} = -\frac{1}{N}\sum_n \big[ y_n \log \hat{y}_n + (1-y_n)\log(1-\hat{y}_n) \big]
+$$
+
+代码对应：`y_pred` 先 clamp 防 `log(0)`，再按公式逐元素算后 `.mean()`。
+
 ```python
 def bce(y_pred, y_true, eps=1e-12):
     # y_pred, y_true: (N,) 或 (N, 1) 概率/0-1标签；返回标量
@@ -93,6 +116,12 @@ def bce(y_pred, y_true, eps=1e-12):
 ```
 
 **④ MSE（回归）**
+
+$$
+L_{\text{MSE}} = \frac{1}{N}\sum_n (y_n - \hat{y}_n)^2
+$$
+
+代码对应：逐元素平方差再 `.mean()`。
 
 ```python
 def mse(y_pred, y_true): return ((y_pred - y_true) ** 2).mean()  # 同 shape 逐元素平方 -> 标量
@@ -324,7 +353,7 @@ def layernorm(x, gamma, beta, eps=1e-5): pass   # x:(...,D)，gamma/beta:(D,) ->
 
 #### 👀 MHA（Multi-Head Attention，含/不含 mask）
 
-将 Q/K/V 投到 $$h$$ 个子空间并行做 scaled dot-product attention，最后拼回并线性变换。核心对象：注意力分数 $$\text{softmax}(QK^\top/\sqrt{d_k})$$。
+将 Q/K/V 投到 $$h$$ 个子空间并行做 scaled dot-product attention，最后拼回并线性变换。核心对象：注意力分数 $$\text{softmax}(QK^\top/\sqrt{d_k})$$，shape 为 `(B, H, Tq, Tk)`——最后一维 `Tk` 是 key 位置，softmax 沿该维归一化。
 
 $$
 \text{Attention}(Q,K,V) = \text{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}} + M\right) V
@@ -369,7 +398,7 @@ class MHA(nn.Module):
         if mask is not None:
             # mask: (1,1,T_q,T_k) 或可广播; 0 处屏蔽（causal 用下三角全 1）
             scores = scores.masked_fill(mask == 0, float('-inf'))  # -inf 经 softmax 后权重为 0
-        attn = F.softmax(scores, dim=-1)               # 沿 T_k 归一化: (B,H,T_q,T_k)，每行和为 1
+        attn = F.softmax(scores, dim=-1)               # dim=-1 = Tk（key 位置）：(B,H,Tq,Tk) 每行对全部 key 归一化
         # out: (B,H,T_q,T_k) @ (B,H,T_k,d_k) -> (B,H,T_q,d_k)：按权重聚合 value
         out = torch.matmul(attn, V)
         # 合头: (B,H,T_q,d_k) -> (B,T_q,d_model)；contiguous 是 transpose 后 view 的前提
@@ -396,11 +425,11 @@ def mha_numpy(X, Wq, Wk, Wv, Wo, num_heads, mask=None):
         y = x @ W                                      # (B,T,D) @ (D,D) -> (B, T, D)
         return y.reshape(B, T, H, d_k).transpose(0, 2, 1, 3)  # 把 D 拆成 (H,d_k) 再把 H 换到轴 1
     Q, K, V = split(X, Wq), split(X, Wk), split(X, Wv)
-    # scores: (B,H,T,d_k) @ (B,H,d_k,T) -> (B, H, T, T)，最后两轴转置即 K^T
+    # scores: (B,H,T,d_k) @ (B,H,d_k,T) -> (B,H,T,T)；自注意力下 Tq=Tk=T，最后一维仍是 key 位置
     scores = Q @ K.transpose(0, 1, 3, 2) / np.sqrt(d_k)
     if mask is not None:
         scores = np.where(mask == 0, -1e9, scores)     # 用大负数而非 -inf，避免整行被屏蔽时出 NaN
-    attn = softmax(scores, axis=-1)                    # (B, H, T, T) 沿 key 维归一化
+    attn = softmax(scores, axis=-1)                    # 沿 Tk（最后一维 / key 位置）归一化，每行和为 1
     out = attn @ V                                     # (B,H,T,T) @ (B,H,T,d_k) -> (B, H, T, d_k)
     # 合头: (B, H, T, d_k) -> (B, T, D)，把各 head 沿特征维拼回
     out = out.transpose(0, 2, 1, 3).reshape(B, T, D)
