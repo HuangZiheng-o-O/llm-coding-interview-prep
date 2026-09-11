@@ -80,6 +80,98 @@ def softmax(x, dim=-1):
 
 **② Cross-Entropy（多分类，logits + class index）**
 
+神经网络通常直接输出：
+
+$$
+z_1,z_2,\dots,z_C
+$$
+
+我们需要先通过 Softmax 转成概率：
+
+$$
+p_i=
+\frac{e^{z_i}}
+{\sum_{j=1}^{C}e^{z_j}}
+$$
+
+因此正确类别 $y$ 的概率为：
+
+$$
+p_y=
+\frac{e^{z_y}}
+{\sum_{j=1}^{C}e^{z_j}}
+$$
+
+再代入 Cross-Entropy：
+
+$$
+L=-\log p_y
+$$
+
+>从完整公式看最清楚。假设有 $C$ 个类别，真实标签分布为 $q$，模型预测概率为 $p$，交叉熵定义为
+>
+>$$
+>L=-\sum_{i=1}^{C} q_i\log p_i
+>$$
+>
+>如果真实类别是 $y$，那么 one-hot 标签就是
+>
+>$$
+>q_i=
+>\begin{cases}
+>1,& i=y\\
+>0,& i\neq y
+>\end{cases}
+>$$
+>
+>代进去：
+>
+>$$
+>L
+>=
+>-\left(
+>0\log p_1+\cdots+1\log p_y+\cdots+0\log p_C
+>\right)
+>$$
+>
+>所以只剩下
+>
+>$$
+>\boxed{L=-\log p_y}
+>$$
+>
+>直觉上，它只关心：**你给正确答案分了多大的概率。**
+>
+
+得到：
+$$
+L=
+-\log
+\left(
+\frac{e^{z_y}}
+{\sum_{j=1}^{C}e^{z_j}}
+\right)
+$$
+
+利用对数公式：
+
+$$
+\log\frac ab=\log a-\log b
+$$
+
+得到：这就是 **logits + class index** 时最重要的 Cross-Entropy 公式
+
+$$
+L
+=
+-z_y+
+\log
+\left(
+\sum_{j=1}^{C}e^{z_j}
+\right)
+$$
+
+
 $$
 L_{\text{CE}}^{\text{multi}}
 = -\frac{1}{N}\sum_{n=1}^{N}
@@ -116,7 +208,6 @@ def bce(y_pred, y_true, eps=1e-12):
 ```
 
 **④ MSE（回归）**
-
 $$
 L_{\text{MSE}} = \frac{1}{N}\sum_n (y_n - \hat{y}_n)^2
 $$
@@ -311,6 +402,10 @@ class LayerNorm(nn.Module):
         return self.gamma * x_hat + self.beta          # (D,) 广播到 (...,D)，逐通道缩放平移
 ```
 
+这里用 `unbiased=False`，也就是方差除以 $D$，因为 LayerNorm 的目的只是对当前 token 的 $D$ 个特征做标准化，并不是用这 $D$ 个值去估计某个更大总体的方差；因此直接计算平均平方偏差 $ \sigma^2=\frac{1}{D}\sum_{i=1}^{D}(x_i-\mu)^2 $ 最自然，这样归一化后 $ \hat{x}_i=\frac{x_i-\mu}{\sqrt{\sigma^2+\epsilon}} $，忽略 $\epsilon$ 时，归一化后的特征均值为 $0$、方差为 $1$；而 `unbiased=True` 会除以 $D-1$，这是统计学中为了让“样本方差”更好地估计“总体方差”而做的 Bessel 校正（它适合这样的场景：你从某个未知概率分布中抽取 *D* 个样本，希望根据这些样本去估计那个分布真正的总体方差。），但 LayerNorm 并不存在这种总体参数估计需求，所以 PyTorch 的 `nn.LayerNorm` 也采用 `unbiased=False`。
+
+
+
 #### （B）NumPy 版本
 
 ```python
@@ -353,6 +448,451 @@ def layernorm(x, gamma, beta, eps=1e-5): pass   # x:(...,D)，gamma/beta:(D,) ->
 
 #### 👀 MHA（Multi-Head Attention，含/不含 mask）
 
+#### 👀 MultiHeadAttention
+```py
+import math
+import torch
+import torch.nn as nn
+from torch import Tensor
+
+
+class MultiHeadAttention(nn.Module):
+    """
+    普通通用 MHA：
+    forward(q_source, k_source, v_source, attn_mask=None)
+
+    适用：
+    1. Self-Attention:
+       q_source = k_source = v_source = x
+    2. Cross-Attention:
+       q_source = decoder_x
+       k_source = v_source = encoder_output
+    """
+
+    def __init__(self, d_model: int, num_heads: int):
+        super().__init__()
+
+        assert d_model % num_heads == 0
+
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_head = d_model // num_heads
+
+        self.W_q = nn.Linear(d_model, d_model)
+        self.W_k = nn.Linear(d_model, d_model)
+        self.W_v = nn.Linear(d_model, d_model)
+        self.W_o = nn.Linear(d_model, d_model)
+
+    def _split_heads(self, x: Tensor) -> Tensor:
+        """
+        x: (B, S, D)
+        view: (B, S, H, d_head)
+        transpose: (B, H, S, d_head)
+
+        作用：
+        把一个 d_model 向量拆成 H 个 attention head。
+        """
+        B, S, D = x.shape
+
+        return x.view(
+            B, S, self.num_heads, self.d_head
+        ).transpose(1, 2)
+
+    def _merge_heads(self, x: Tensor) -> Tensor:
+        """
+        x: (B, H, S, d_head)
+        transpose: (B, S, H, d_head)
+        reshape: (B, S, D)
+
+        作用：
+        把多个 head 的结果重新拼回 d_model。
+        """
+        B, H, S, d_head = x.shape
+
+        return x.transpose(1, 2).contiguous().view(
+            B, S, H * d_head
+        )
+
+    def forward(
+        self,
+        q_source: Tensor,
+        k_source: Tensor,
+        v_source: Tensor,
+        attn_mask: Tensor | None = None,
+    ) -> Tensor:
+        """
+        q_source: (B, S_q, D)
+        k_source: (B, S_k, D)
+        v_source: (B, S_k, D)
+
+        attn_mask:
+        - None，表示不 mask
+        - 或 shape 可 broadcast 到 (B, H, S_q, S_k)
+        - True 表示禁止 attend 的位置
+        """
+
+        B, S_q, _ = q_source.shape
+        S_k = k_source.shape[1]
+
+        # q: (B, S_q, D) -> (B, H, S_q, d_head)
+        q = self._split_heads(self.W_q(q_source))
+
+        # k: (B, S_k, D) -> (B, H, S_k, d_head)
+        k = self._split_heads(self.W_k(k_source))
+
+        # v: (B, S_k, D) -> (B, H, S_k, d_head)
+        v = self._split_heads(self.W_v(v_source))
+
+        # k.transpose(-2, -1): (B, H, d_head, S_k)
+        # scores: (B, H, S_q, S_k)
+        # 作用：每个 query token 对每个 key token 打分
+        scores = torch.matmul(
+            q, k.transpose(-2, -1)
+        ) / math.sqrt(self.d_head)
+
+        if attn_mask is not None:
+            # attn_mask broadcast 到 scores
+            # True 的位置被置为 -inf，softmax 后概率接近 0
+            scores = scores.masked_fill(
+                attn_mask, float("-inf")
+            )
+
+        # weights: (B, H, S_q, S_k)
+        # dim=-1 表示每个 query 对所有 key 做 softmax
+        weights = torch.softmax(scores, dim=-1)
+
+        # attn: (B, H, S_q, d_head)
+        # 作用：用 attention weights 对 value 加权求和
+        attn = torch.matmul(weights, v)
+
+        # out: (B, S_q, D)
+        out = self._merge_heads(attn)
+
+        return self.W_o(out)
+```
+#### 👀 DecoderSelfAttentionWithKVCache
+```py
+class DecoderSelfAttentionWithKVCache(nn.Module):
+    """
+    Decoder Self-Attention + KV cache：
+    forward(x_new, cache=None)
+
+    因为 Q/K/V 都来自 decoder 的 x_new，
+    所以每一步只对新 token 计算 q_new/k_new/v_new。
+
+    cache:
+    - None
+    - 或 (past_k, past_v)
+
+    past_k: (B, H, S_past, d_head)
+    past_v: (B, H, S_past, d_head)
+    """
+
+    def __init__(self, d_model: int, num_heads: int):
+        super().__init__()
+
+        assert d_model % num_heads == 0
+
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_head = d_model // num_heads
+
+        self.W_q = nn.Linear(d_model, d_model)
+        self.W_k = nn.Linear(d_model, d_model)
+        self.W_v = nn.Linear(d_model, d_model)
+        self.W_o = nn.Linear(d_model, d_model)
+
+    def _split_heads(self, x: Tensor) -> Tensor:
+        """
+        x: (B, S, D)
+        return: (B, H, S, d_head)
+        """
+        B, S, D = x.shape
+
+        return x.view(
+            B, S, self.num_heads, self.d_head
+        ).transpose(1, 2)
+
+    def _merge_heads(self, x: Tensor) -> Tensor:
+        """
+        x: (B, H, S, d_head)
+        return: (B, S, D)
+        """
+        B, H, S, d_head = x.shape
+
+        return x.transpose(1, 2).contiguous().view(
+            B, S, H * d_head
+        )
+
+    def forward(
+        self,
+        x_new: Tensor,
+        cache: tuple[Tensor, Tensor] | None = None,
+    ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
+        """
+        x_new: (B, S_new, D)
+
+        训练 / prefill:
+        - S_new 可以大于 1
+        - cache 通常为 None
+
+        增量 decode:
+        - S_new 通常等于 1
+        - cache 保存过去所有 token 的 K/V
+        """
+
+        B, S_new, _ = x_new.shape
+
+        # q_new: (B, S_new, D) -> (B, H, S_new, d_head)
+        q_new = self._split_heads(self.W_q(x_new))
+
+        # k_new: (B, S_new, D) -> (B, H, S_new, d_head)
+        k_new = self._split_heads(self.W_k(x_new))
+
+        # v_new: (B, S_new, D) -> (B, H, S_new, d_head)
+        v_new = self._split_heads(self.W_v(x_new))
+
+        if cache is None:
+            # 没有历史 token，total 就是当前 new token
+            k_total = k_new
+            v_total = v_new
+        else:
+            past_k, past_v = cache
+
+            # past_k: (B, H, S_past, d_head)
+            # k_new:  (B, H, S_new,  d_head)
+            # cat dim=2，也就是 sequence 维度
+            # k_total: (B, H, S_past + S_new, d_head)
+            k_total = torch.cat([past_k, k_new], dim=2)
+            v_total = torch.cat([past_v, v_new], dim=2)
+
+        new_cache = (k_total, v_total)
+
+        S_total = k_total.shape[2]
+        S_past = S_total - S_new
+
+        # scores: (B, H, S_new, S_total)
+        # 每个新 query 可以看向 cache 中的历史 K，
+        # 以及当前 chunk 内允许看的 K。
+        scores = torch.matmul(
+            q_new, k_total.transpose(-2, -1)
+        ) / math.sqrt(self.d_head)
+
+        if S_new > 1:
+            # prefill 或 chunk decode 时需要 causal mask。
+            #
+            # query 位置范围：
+            # 当前 chunk 的第 i 个 query，
+            # 它在完整序列中的绝对位置是 S_past + i。
+            #
+            # key 位置范围：
+            # 0 到 S_total - 1。
+            #
+            # 如果 key_pos > query_abs_pos，则不能 attend。
+            #
+            # mask: (S_new, S_total)
+            # True 表示未来位置，需要屏蔽。
+            q_pos = torch.arange(
+                S_past, S_total, device=x_new.device
+            ).unsqueeze(1)               # (S_new, 1)
+
+            k_pos = torch.arange(
+                S_total, device=x_new.device
+            ).unsqueeze(0)               # (1, S_total)
+
+            mask = k_pos > q_pos         # (S_new, S_total)
+
+            # mask broadcast:
+            # (S_new, S_total)
+            # -> (1, 1, S_new, S_total)
+            # -> 匹配 scores: (B, H, S_new, S_total)
+            scores = scores.masked_fill(
+                mask.unsqueeze(0).unsqueeze(0),
+                float("-inf"),
+            )
+
+        # decode 单 token 时 S_new == 1：
+        # 当前 token 的 query 可以 attend 所有 past + current，
+        # 不需要额外 causal mask。
+        weights = torch.softmax(scores, dim=-1)
+
+        # attn: (B, H, S_new, d_head)
+        attn = torch.matmul(weights, v_total)
+
+        # out: (B, S_new, D)
+        out = self._merge_heads(attn)
+
+        return self.W_o(out), new_cache
+```
+#### 👀 CrossAttentionWithKVCache
+
+```py
+
+class CrossAttentionWithKVCache(nn.Module):
+    """
+    Cross-Attention + KV cache：
+    forward(decoder_x, encoder_output, cache=None)
+
+    Q 来源：decoder_x
+    K/V 来源：encoder_output
+
+    encoder_output 在整个 decoding 过程中不变，
+    所以 cross-attention 的 K/V 可以缓存。
+    """
+
+    def __init__(self, d_model: int, num_heads: int):
+        super().__init__()
+
+        assert d_model % num_heads == 0
+
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_head = d_model // num_heads
+
+        self.W_q = nn.Linear(d_model, d_model)
+        self.W_k = nn.Linear(d_model, d_model)
+        self.W_v = nn.Linear(d_model, d_model)
+        self.W_o = nn.Linear(d_model, d_model)
+
+    def _split_heads(self, x: Tensor) -> Tensor:
+        """
+        x: (B, S, D)
+        return: (B, H, S, d_head)
+        """
+        B, S, D = x.shape
+
+        return x.view(
+            B, S, self.num_heads, self.d_head
+        ).transpose(1, 2)
+
+    def _merge_heads(self, x: Tensor) -> Tensor:
+        """
+        x: (B, H, S, d_head)
+        return: (B, S, D)
+        """
+        B, H, S, d_head = x.shape
+
+        return x.transpose(1, 2).contiguous().view(
+            B, S, H * d_head
+        )
+
+    def forward(
+        self,
+        decoder_x: Tensor,
+        encoder_output: Tensor,
+        cache: tuple[Tensor, Tensor] | None = None,
+        encoder_mask: Tensor | None = None,
+    ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
+        """
+        decoder_x: (B, S_q, D)
+        encoder_output: (B, S_enc, D)
+
+        cache:
+        - None：第一次 cross-attention，计算 encoder K/V
+        - (enc_k, enc_v)：后续 decode 复用 encoder K/V
+
+        encoder_mask:
+        - None
+        - 或 shape 可 broadcast 到 (B, H, S_q, S_enc)
+        - True 表示 encoder padding，需要屏蔽
+        """
+
+        B, S_q, _ = decoder_x.shape
+
+        # q: (B, S_q, D) -> (B, H, S_q, d_head)
+        # 注意：Q 来自 decoder 当前 hidden states。
+        q = self._split_heads(self.W_q(decoder_x))
+
+        if cache is None:
+            # 第一次调用时，从 encoder_output 计算 K/V。
+            # encoder_output: (B, S_enc, D)
+            #
+            # enc_k: (B, H, S_enc, d_head)
+            # enc_v: (B, H, S_enc, d_head)
+            enc_k = self._split_heads(self.W_k(encoder_output))
+            enc_v = self._split_heads(self.W_v(encoder_output))
+        else:
+            # 后续 decode 复用 encoder K/V。
+            # 因为 encoder_output 不随 decoder step 改变。
+            enc_k, enc_v = cache
+
+        new_cache = (enc_k, enc_v)
+
+        # scores: (B, H, S_q, S_enc)
+        # 每个 decoder query attend 所有 encoder key。
+        scores = torch.matmul(
+            q, enc_k.transpose(-2, -1)
+        ) / math.sqrt(self.d_head)
+
+        if encoder_mask is not None:
+            # encoder_mask 通常用于屏蔽 padding token。
+            # broadcast 到 scores 后，True 的位置不可见。
+            scores = scores.masked_fill(
+                encoder_mask, float("-inf")
+            )
+
+        # weights: (B, H, S_q, S_enc)
+        weights = torch.softmax(scores, dim=-1)
+
+        # attn: (B, H, S_q, d_head)
+        attn = torch.matmul(weights, enc_v)
+
+        # out: (B, S_q, D)
+        out = self._merge_heads(attn)
+
+        return self.W_o(out), new_cache
+
+
+# Demo
+if __name__ == "__main__":
+    torch.manual_seed(0)
+
+    B, D, H = 2, 32, 4
+    S_q, S_k, S_new, S_enc = 3, 5, 1, 6
+
+    # 1. 普通 MHA
+    mha = MultiHeadAttention(D, H)
+    q_src = torch.randn(B, S_q, D)
+    k_src = torch.randn(B, S_k, D)
+    v_src = torch.randn(B, S_k, D)
+    out = mha(q_src, k_src, v_src)
+    print("MHA:", out.shape)  # (B, S_q, D)
+
+    # 2. Decoder Self-Attention + KV cache
+    self_attn = DecoderSelfAttentionWithKVCache(D, H)
+    x1 = torch.randn(B, 4, D)
+    x2 = torch.randn(B, S_new, D)
+
+    out1, cache = self_attn(x1, cache=None)
+    out2, cache = self_attn(x2, cache=cache)
+
+    print("Self out1:", out1.shape)          # (B, 4, D)
+    print("Self out2:", out2.shape)          # (B, 1, D)
+    print("Self cache K:", cache[0].shape)   # (B, H, 5, d_head)
+
+    # 3. Cross-Attention + KV cache
+    cross_attn = CrossAttentionWithKVCache(D, H)
+    decoder_x = torch.randn(B, S_new, D)
+    encoder_output = torch.randn(B, S_enc, D)
+
+    cross_out1, cross_cache = cross_attn(
+        decoder_x,
+        encoder_output,
+        cache=None,
+    )
+
+    cross_out2, cross_cache = cross_attn(
+        decoder_x,
+        encoder_output,
+        cache=cross_cache,
+    )
+
+    print("Cross out:", cross_out1.shape)        # (B, 1, D)
+    print("Cross cache K:", cross_cache[0].shape) # (B, H, S_enc, d_head)
+```
+
+
+
 将 Q/K/V 投到 $$h$$ 个子空间并行做 scaled dot-product attention，最后拼回并线性变换。核心对象：注意力分数 $$\text{softmax}(QK^\top/\sqrt{d_k})$$，shape 为 `(B, H, Tq, Tk)`——最后一维 `Tk` 是 key 位置，softmax 沿该维归一化。
 
 $$
@@ -368,6 +908,14 @@ $$
 
 #### （A）PyTorch 版本
 
+```
+Q: (B, H, T_q, d_q)
+K: (B, H, T_k, d_k)
+V: (B, H, T_k, d_v)
+```
+
+
+
 ```python
 import math
 import torch
@@ -381,11 +929,11 @@ class MHA(nn.Module):
         self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads           # 每个 head 的维度 d_k
-        self.Wq = nn.Linear(d_model, d_model)          # 四个投影都是 D->D，内部再切成 H 份
+        self.Wq = nn.Linear(d_model, d_model)         
         self.Wk = nn.Linear(d_model, d_model)
         self.Wv = nn.Linear(d_model, d_model)
         self.Wo = nn.Linear(d_model, d_model)
-
+#‼️Cross Attention 中 Q 来自一边，K,V 来自另一边；d_q=d_k 必须满足，d_v 可以不同，但实际 Transformer 通常也设成一样。
     def forward(self, Q, K, V, mask=None):
         # Q, K, V: (B, T, d_model)；mask 可选 -> 返回 (B, T_q, d_model)
         B = Q.size(0)                                  # batch size
@@ -394,14 +942,15 @@ class MHA(nn.Module):
         K = self.Wk(K).view(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
         V = self.Wv(V).view(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
         # scores: (B,H,T_q,d_k) @ (B,H,d_k,T_k) -> (B,H,T_q,T_k)
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.head_dim)  # 除 sqrt(d_k) 防 softmax 饱和
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.head_dim)  # 除 sqrt(d_k) 防 softmax 饱和；因为 Q\cdot K 的方差随 d_k 增长，而标准差随 \sqrt{d_k} 增长
         if mask is not None:
             # mask: (1,1,T_q,T_k) 或可广播; 0 处屏蔽（causal 用下三角全 1）
-            scores = scores.masked_fill(mask == 0, float('-inf'))  # -inf 经 softmax 后权重为 0
+            scores = scores.masked_fill(mask == 0, float('-inf'))  # -inf 经 softmax 后权重为 0；scores.masked_fill(条件, 值) 的意思是：在 scores 里，凡是条件为 True 的位置，替换成指定的值。
         attn = F.softmax(scores, dim=-1)               # dim=-1 = Tk（key 位置）：(B,H,Tq,Tk) 每行对全部 key 归一化
-        # out: (B,H,T_q,T_k) @ (B,H,T_k,d_k) -> (B,H,T_q,d_k)：按权重聚合 value
+        # out: (B,H,T_q,T_k) @ (B,H,T_k,d_v) -> (B,H,T_q,d_v)：按权重聚合 value
         out = torch.matmul(attn, V)
-        # 合头: (B,H,T_q,d_k) -> (B,T_q,d_model)；contiguous 是 transpose 后 view 的前提
+        # 合头: (B,H,T_q,d_v) -> (B,T_q,d_model)；contiguous 是 transpose 后 view 的前提
+        # view() 通常要求连续内存，所以先调用 contiguous()。
         out = out.transpose(1, 2).contiguous().view(B, -1, self.d_model)
         return self.Wo(out)                            # 融合各 head 信息，shape 不变
 ```
@@ -512,7 +1061,7 @@ class MHAWithKVCache(nn.Module):
         self.Wk = nn.Linear(d_model, d_model)
         self.Wv = nn.Linear(d_model, d_model)
         self.Wo = nn.Linear(d_model, d_model)
-
+ 
     def _split(self, x):
         # (B, T, D) -> (B, H, T, d_k)：拆 head 并把 H 提到 batch 之后
         B, T, _ = x.shape
