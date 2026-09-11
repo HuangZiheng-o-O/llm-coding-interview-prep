@@ -16,7 +16,3 @@
 | **C：岗位相关** | Linear Attention、Conv2D、ViT Patch Embedding、Linear Regression |
 
 文档中标有 👀 的小节是重点复习条目。
-
-## License
-
-内容仅供个人学习与面试准备参考。
