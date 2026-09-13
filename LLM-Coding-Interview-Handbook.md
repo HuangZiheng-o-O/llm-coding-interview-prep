@@ -574,11 +574,25 @@ class MultiHeadAttention(nn.Module):
 ```py
 class DecoderSelfAttentionWithKVCache(nn.Module):
     """
-    Decoder Self-Attention + KV cache：
-    forward(x_new, cache=None)
+    Decoder Self-Attention + KV cache。
 
-    因为 Q/K/V 都来自 decoder 的 x_new，
-    所以每一步只对新 token 计算 q_new/k_new/v_new。
+    【相对上一段 MultiHeadAttention 的核心差别】
+    1. API：
+       - 普通 MHA: forward(q_source, k_source, v_source, attn_mask)
+         每次传入完整序列，Q/K/V 都整段重算。
+       - 本类:     forward(x_new, cache=None)
+         只传入「本步新 token」；历史 K/V 从 cache 读，不再重算。
+    2. 返回值：
+       - 普通 MHA 只返回 out
+       - 本类返回 (out, new_cache)，供下一步 decode 复用
+    3. 注意力时间维：
+       - 普通 MHA: scores 是 (B,H,S_q,S_k)，S_q 与 S_k 都来自当次输入
+       - 本类:     scores 是 (B,H,S_new,S_total)
+         Q 只有新 token；K/V 是 past + new 拼起来的完整历史
+    4. Mask：
+       - 普通 MHA: 外部传入 attn_mask（可选）
+       - 本类:     内建 causal mask，且要按 S_past 做绝对位置偏移
+                   （decode 单 token 时 S_new==1，可省略）
 
     cache:
     - None
@@ -597,6 +611,7 @@ class DecoderSelfAttentionWithKVCache(nn.Module):
         self.num_heads = num_heads
         self.d_head = d_model // num_heads
 
+        # 与普通 MHA 相同：四套线性层。差别不在权重，在 forward 怎么用。
         self.W_q = nn.Linear(d_model, d_model)
         self.W_k = nn.Linear(d_model, d_model)
         self.W_v = nn.Linear(d_model, d_model)
@@ -606,6 +621,7 @@ class DecoderSelfAttentionWithKVCache(nn.Module):
         """
         x: (B, S, D)
         return: (B, H, S, d_head)
+        # 与普通 MHA 完全相同
         """
         B, S, D = x.shape
 
@@ -617,6 +633,7 @@ class DecoderSelfAttentionWithKVCache(nn.Module):
         """
         x: (B, H, S, d_head)
         return: (B, S, D)
+        # 与普通 MHA 完全相同
         """
         B, H, S, d_head = x.shape
 
@@ -635,25 +652,33 @@ class DecoderSelfAttentionWithKVCache(nn.Module):
         训练 / prefill:
         - S_new 可以大于 1
         - cache 通常为 None
+        - 行为接近「对整段 x 做一遍 self-attn」，但返回值多了 cache
 
         增量 decode:
         - S_new 通常等于 1
         - cache 保存过去所有 token 的 K/V
+        - 【相对普通 MHA】不必再把历史 token 整段喂进来重算 K/V
         """
 
         B, S_new, _ = x_new.shape
 
+        # 【相对普通 MHA】
+        # 普通 MHA: q/k/v 分别由 q_source / k_source / v_source 投影，
+        #           且通常对「整段序列」做投影。
+        # 本类:     self-attn，Q/K/V 同源；但只对「本步新 token」投影。
         # q_new: (B, S_new, D) -> (B, H, S_new, d_head)
         q_new = self._split_heads(self.W_q(x_new))
 
+        # k_new / v_new 也只算新 token；历史部分后面从 cache 拼回来
         # k_new: (B, S_new, D) -> (B, H, S_new, d_head)
         k_new = self._split_heads(self.W_k(x_new))
 
         # v_new: (B, S_new, D) -> (B, H, S_new, d_head)
         v_new = self._split_heads(self.W_v(x_new))
 
+        # ========== 相对普通 MHA 的独特步骤：拼 / 建 KV cache ==========
         if cache is None:
-            # 没有历史 token，total 就是当前 new token
+            # prefill / 第一步：没有历史，total 就是当前 new
             k_total = k_new
             v_total = v_new
         else:
@@ -661,37 +686,46 @@ class DecoderSelfAttentionWithKVCache(nn.Module):
 
             # past_k: (B, H, S_past, d_head)
             # k_new:  (B, H, S_new,  d_head)
-            # cat dim=2，也就是 sequence 维度
+            # cat dim=2 = sequence 维
             # k_total: (B, H, S_past + S_new, d_head)
+            #
+            # 【相对普通 MHA】普通 MHA 没有这一步：
+            # 它每次都会用完整 k_source 重新算整段 K。
+            # 这里用 cat 复用历史 K/V，只把新 token 接在后面。
             k_total = torch.cat([past_k, k_new], dim=2)
             v_total = torch.cat([past_v, v_new], dim=2)
 
+        # 更新 cache：下一步 decode 继续往后拼
         new_cache = (k_total, v_total)
 
         S_total = k_total.shape[2]
         S_past = S_total - S_new
 
-        # scores: (B, H, S_new, S_total)
-        # 每个新 query 可以看向 cache 中的历史 K，
-        # 以及当前 chunk 内允许看的 K。
+        # 【相对普通 MHA】
+        # 普通 MHA: matmul(q, k^T)  -> scores (B,H,S_q,S_k)
+        #           Q 与 K 的序列长度都来自当次完整输入。
+        # 本类:     matmul(q_new, k_total^T) -> scores (B,H,S_new,S_total)
+        #           Q 只有新 token；K 覆盖 past+new。
+        #           这正是「cache 省算力」的体现：旧 token 的 Q 不再算，
+        #           旧 token 的 K/V 也不再投影，只读 cache。
         scores = torch.matmul(
             q_new, k_total.transpose(-2, -1)
         ) / math.sqrt(self.d_head)
 
         if S_new > 1:
-            # prefill 或 chunk decode 时需要 causal mask。
+            # prefill / chunk decode：需要 causal mask。
             #
-            # query 位置范围：
-            # 当前 chunk 的第 i 个 query，
-            # 它在完整序列中的绝对位置是 S_past + i。
+            # 【相对普通 MHA】
+            # 普通 MHA: 调用方自己传 attn_mask。
+            # 本类:     内部按「绝对位置」生成 causal mask，
+            #           因为 query 的真实下标不是从 0 开始，
+            #           而是从 S_past 开始。
             #
-            # key 位置范围：
-            # 0 到 S_total - 1。
+            # 当前 chunk 第 i 个 query 的绝对位置 = S_past + i
+            # key 位置 = 0 .. S_total-1
+            # 若 key_pos > query_abs_pos，则屏蔽（未来不可见）
             #
-            # 如果 key_pos > query_abs_pos，则不能 attend。
-            #
-            # mask: (S_new, S_total)
-            # True 表示未来位置，需要屏蔽。
+            # mask: (S_new, S_total)，True = 禁止 attend
             q_pos = torch.arange(
                 S_past, S_total, device=x_new.device
             ).unsqueeze(1)               # (S_new, 1)
@@ -702,26 +736,26 @@ class DecoderSelfAttentionWithKVCache(nn.Module):
 
             mask = k_pos > q_pos         # (S_new, S_total)
 
-            # mask broadcast:
-            # (S_new, S_total)
-            # -> (1, 1, S_new, S_total)
-            # -> 匹配 scores: (B, H, S_new, S_total)
+            # (S_new, S_total) -> (1,1,S_new,S_total) 以匹配 scores
             scores = scores.masked_fill(
                 mask.unsqueeze(0).unsqueeze(0),
                 float("-inf"),
             )
 
-        # decode 单 token 时 S_new == 1：
-        # 当前 token 的 query 可以 attend 所有 past + current，
-        # 不需要额外 causal mask。
+        # decode 单 token（S_new == 1）时：
+        # 唯一的 query 可以看 past+current 全部位置，天然因果，无需再 mask。
+        # 【相对普通 MHA】普通 MHA 即便 S_q==1，若外部不传 mask 也不会自动因果；
+        # 这里靠「只喂新 token + cache 拼历史」保证看不到未来。
         weights = torch.softmax(scores, dim=-1)
 
+        # 【相对普通 MHA】用 v_total（含 cache），不是仅用当次 v_new
         # attn: (B, H, S_new, d_head)
         attn = torch.matmul(weights, v_total)
 
-        # out: (B, S_new, D)
+        # out: (B, S_new, D)  —— 只输出新 token 位置的表示
         out = self._merge_heads(attn)
 
+        # 【相对普通 MHA】多返回 new_cache
         return self.W_o(out), new_cache
 ```
 #### 👀 CrossAttentionWithKVCache
@@ -730,14 +764,23 @@ class DecoderSelfAttentionWithKVCache(nn.Module):
 
 class CrossAttentionWithKVCache(nn.Module):
     """
-    Cross-Attention + KV cache：
-    forward(decoder_x, encoder_output, cache=None)
+    Cross-Attention + KV cache。
 
-    Q 来源：decoder_x
-    K/V 来源：encoder_output
-
-    encoder_output 在整个 decoding 过程中不变，
-    所以 cross-attention 的 K/V 可以缓存。
+    【相对上一段 MultiHeadAttention 的核心差别】
+    1. API：
+       - 普通 MHA: forward(q_source, k_source, v_source, attn_mask)
+         Q/K/V 三个源每次都传入并整段投影。
+       - 本类:     forward(decoder_x, encoder_output, cache=None, encoder_mask=None)
+         语义写死为 cross-attn：Q←decoder，K/V←encoder。
+    2. Cache 语义（与 DecoderSelfAttentionWithKVCache 也不同！）：
+       - Decoder Self + cache: K/V 随 decode 不断 cat 变长（增长型 cache）
+       - Cross + cache:        encoder K/V 算一次后原样复用（固定型 cache）
+         因为 encoder_output 在整个 decoding 过程中不变，不需要逐步追加。
+    3. Mask：
+       - 普通 MHA: 通用 attn_mask
+       - 本类:     通常是 encoder padding mask；没有 causal mask
+                   （decoder 可以看全部 encoder token）
+    4. 返回值：同样是 (out, new_cache)，但 cache 长度始终 = S_enc，不会变长。
     """
 
     def __init__(self, d_model: int, num_heads: int):
@@ -749,6 +792,7 @@ class CrossAttentionWithKVCache(nn.Module):
         self.num_heads = num_heads
         self.d_head = d_model // num_heads
 
+        # 与普通 MHA / DecoderSelf+KVCache 相同的四套线性层
         self.W_q = nn.Linear(d_model, d_model)
         self.W_k = nn.Linear(d_model, d_model)
         self.W_v = nn.Linear(d_model, d_model)
@@ -758,6 +802,7 @@ class CrossAttentionWithKVCache(nn.Module):
         """
         x: (B, S, D)
         return: (B, H, S, d_head)
+        # 与普通 MHA 完全相同
         """
         B, S, D = x.shape
 
@@ -769,6 +814,7 @@ class CrossAttentionWithKVCache(nn.Module):
         """
         x: (B, H, S, d_head)
         return: (B, S, D)
+        # 与普通 MHA 完全相同
         """
         B, H, S, d_head = x.shape
 
@@ -799,34 +845,46 @@ class CrossAttentionWithKVCache(nn.Module):
 
         B, S_q, _ = decoder_x.shape
 
+        # 【相对普通 MHA】
+        # 普通 MHA: q = split(W_q(q_source))，q_source 由调用方决定。
+        # 本类:     Q 固定来自 decoder 当前 hidden；每一步都要重算 Q
+        #           （decoder 在变；encoder 不变）。
         # q: (B, S_q, D) -> (B, H, S_q, d_head)
-        # 注意：Q 来自 decoder 当前 hidden states。
         q = self._split_heads(self.W_q(decoder_x))
 
+        # ========== 相对普通 MHA 的独特步骤：缓存 encoder K/V ==========
         if cache is None:
-            # 第一次调用时，从 encoder_output 计算 K/V。
-            # encoder_output: (B, S_enc, D)
-            #
+            # 第一次：从 encoder_output 投影得到 K/V 并写入 cache。
+            # 【相对普通 MHA】普通 MHA 每次都会 W_k(k_source)、W_v(v_source)。
+            # 【相对 DecoderSelf+KVCache】这里不算「新 token 再 cat」，
+            #   而是一次性算完整 encoder 序列的 K/V。
             # enc_k: (B, H, S_enc, d_head)
             # enc_v: (B, H, S_enc, d_head)
             enc_k = self._split_heads(self.W_k(encoder_output))
             enc_v = self._split_heads(self.W_v(encoder_output))
         else:
-            # 后续 decode 复用 encoder K/V。
-            # 因为 encoder_output 不随 decoder step 改变。
+            # 后续 decode：直接复用，不再对 encoder_output 做投影。
+            # encoder_output 不随 decoder step 改变，故 cache 长度恒为 S_enc。
+            # 【注意】即使调用方仍传入 encoder_output，有 cache 时也不用它算 K/V。
             enc_k, enc_v = cache
 
+        # 【相对 DecoderSelf+KVCache】
+        # Self+cache: new_cache = cat(past, new) —— 变长
+        # Cross+cache: new_cache = 原样 (enc_k, enc_v) —— 定长
         new_cache = (enc_k, enc_v)
 
-        # scores: (B, H, S_q, S_enc)
-        # 每个 decoder query attend 所有 encoder key。
+        # 【相对普通 MHA】
+        # 普通 MHA: scores = q @ k^T，k 来自当次 k_source
+        # 本类:     scores = q @ enc_k^T，enc_k 来自 cache（或首次投影）
+        # shape: (B, H, S_q, S_enc)
         scores = torch.matmul(
             q, enc_k.transpose(-2, -1)
         ) / math.sqrt(self.d_head)
 
         if encoder_mask is not None:
-            # encoder_mask 通常用于屏蔽 padding token。
-            # broadcast 到 scores 后，True 的位置不可见。
+            # 【相对普通 MHA / DecoderSelf+KVCache】
+            # 这里不是 causal mask，而是 encoder padding mask：
+            # decoder 可以看全部有效 encoder token，只屏蔽 pad。
             scores = scores.masked_fill(
                 encoder_mask, float("-inf")
             )
@@ -840,17 +898,18 @@ class CrossAttentionWithKVCache(nn.Module):
         # out: (B, S_q, D)
         out = self._merge_heads(attn)
 
+        # 【相对普通 MHA】多返回 new_cache（定长 encoder K/V）
         return self.W_o(out), new_cache
 
 
-# Demo
+# Demo：对照三种 forward 用法
 if __name__ == "__main__":
     torch.manual_seed(0)
 
     B, D, H = 2, 32, 4
     S_q, S_k, S_new, S_enc = 3, 5, 1, 6
 
-    # 1. 普通 MHA
+    # 1. 普通 MHA：一次传入完整 Q/K/V 源，只返回 out，无 cache
     mha = MultiHeadAttention(D, H)
     q_src = torch.randn(B, S_q, D)
     k_src = torch.randn(B, S_k, D)
@@ -858,19 +917,21 @@ if __name__ == "__main__":
     out = mha(q_src, k_src, v_src)
     print("MHA:", out.shape)  # (B, S_q, D)
 
-    # 2. Decoder Self-Attention + KV cache
+    # 2. Decoder Self + KV cache：
+    #    先 prefill 整段，再只喂 1 个新 token；cache K 从 4 变长到 5
     self_attn = DecoderSelfAttentionWithKVCache(D, H)
     x1 = torch.randn(B, 4, D)
     x2 = torch.randn(B, S_new, D)
 
-    out1, cache = self_attn(x1, cache=None)
-    out2, cache = self_attn(x2, cache=cache)
+    out1, cache = self_attn(x1, cache=None)      # 增长型 cache 起步
+    out2, cache = self_attn(x2, cache=cache)     # cat 新 K/V，不必重算历史
 
     print("Self out1:", out1.shape)          # (B, 4, D)
     print("Self out2:", out2.shape)          # (B, 1, D)
-    print("Self cache K:", cache[0].shape)   # (B, H, 5, d_head)
+    print("Self cache K:", cache[0].shape)   # (B, H, 5, d_head) ← 变长
 
-    # 3. Cross-Attention + KV cache
+    # 3. Cross + KV cache：
+    #    第一次算 encoder K/V；第二次复用，cache 长度始终 = S_enc（定长）
     cross_attn = CrossAttentionWithKVCache(D, H)
     decoder_x = torch.randn(B, S_new, D)
     encoder_output = torch.randn(B, S_enc, D)
@@ -878,17 +939,17 @@ if __name__ == "__main__":
     cross_out1, cross_cache = cross_attn(
         decoder_x,
         encoder_output,
-        cache=None,
+        cache=None,          # 首次：投影 encoder → K/V
     )
 
     cross_out2, cross_cache = cross_attn(
         decoder_x,
         encoder_output,
-        cache=cross_cache,
+        cache=cross_cache,   # 复用：不再投影 encoder
     )
 
-    print("Cross out:", cross_out1.shape)        # (B, 1, D)
-    print("Cross cache K:", cross_cache[0].shape) # (B, H, S_enc, d_head)
+    print("Cross out:", cross_out1.shape)         # (B, 1, D)
+    print("Cross cache K:", cross_cache[0].shape) # (B, H, S_enc, d_head) ← 定长
 ```
 
 
