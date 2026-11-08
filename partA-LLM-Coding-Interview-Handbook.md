@@ -18,6 +18,351 @@
 
 > 本章分两部分：**第一部分**为主文档原有题目，**第二部分**为《补充文档-LLM面试手撕代码补充题单》新增题目。
 
+#### 1️⃣ 经典 ML Coding 面试题：Implement K-Means from Scratch
+
+**题目要求：** 实现 K-Means 聚类算法，不使用 `sklearn.cluster.KMeans`。
+
+输入包括：
+
+- `points`：数据点，形状 $(N,D)$。
+- `k`：聚类数量。
+- `initial_centroids`：给定的初始聚类中心，形状 $(K,D)$。
+- `max_iterations`：最大迭代次数。
+
+输出最终的 $K$ 个聚类中心，每个坐标保留四位小数。Interview Query 的同类变体则要求返回每个样本所属的聚类标签。\[[Deep-ML](https://www.deep-ml.com/problems/17?utm_source=chatgpt.com); [Interview Query \| k-Means from Scratch](https://www.interviewquery.com/questions/k-means-from-scratch?utm_source=chatgpt.com)\]
+
+原题示例
+
+输入点
+
+最终聚类中心
+
+样本分别聚集在 $x=1$ 与 $x=10$ 附近，最终中心为 **$1, 2)** 和 **\(10, 2)**。
+
+2️⃣ Global Equations：核心数学公式
+
+K-Means 的目标是最小化簇内平方误差（Within-Cluster Sum of Squares）：
+
+$$
+\boxed{
+J=\sum_{i=1}^{N}\|x_i-\mu_{z_i}\|_2^2
+}
+$$
+
+其中 $x_i$ 是第 $i$ 个样本，$\mu_j$ 是第 $j$ 个中心，$z_i$ 是样本所属的聚类编号。
+
+Step 1：Assignment（分配样本）
+
+计算样本 $x_i$ 到中心 $\mu_j$ 的平方欧氏距离：
+
+$$
+D_{ij}=\sum_{d=1}^{D}(x_{id}-\mu_{jd})^2
+$$
+
+然后选择距离最小的中心：
+
+$$
+\boxed{z_i=\arg\min_j D_{ij}}
+$$
+
+使用平方距离即可，无须计算平方根，因为不会改变最近中心的选择。
+
+Step 2：Update（更新聚类中心）
+
+计算第 $j$ 个簇中所有样本的均值：
+
+$$
+\boxed{
+\mu_j^{\text{new}}
+=
+\frac{
+\sum_{i=1}^{N}\mathbf{1}[z_i=j]x_i
+}{
+\sum_{i=1}^{N}\mathbf{1}[z_i=j]
+}
+}
+$$
+
+如果第 $j$ 个簇为空，分母为零，则保留原来的中心。
+
+不断执行 Assignment → Update，直到中心不再明显变化，或者达到最大迭代次数。
+
+3️⃣ Implementation Blocks
+
+（A）PyTorch 版本（标准实现）
+
+```python
+import torch
+
+def k_means_clustering(
+    points, k, initial_centroids, max_iterations
+):
+    # X: (N, D)，N 个样本，每个样本 D 维
+    X = torch.tensor(points, dtype=torch.float64)
+    # centroids: (K, D)，当前 K 个聚类中心
+    centroids = torch.tensor(
+        initial_centroids, dtype=torch.float64
+    )
+    # 最多执行 max_iterations 次聚类更新
+    for _ in range(max_iterations):
+        # 广播 (N,1,D)-(1,K,D) -> (N,K,D)
+        # 沿特征维求和，得到距离矩阵 (N,K)
+        distances = (
+            (X[:, None, :] - centroids[None, :, :]) ** 2
+        ).sum(dim=-1)
+        # labels: (N,)，每个点最近的中心编号
+        labels = distances.argmin(dim=1)
+        # 复制中心，空簇可以保留原来的位置
+        new_centroids = centroids.clone()
+        # 逐个更新 K 个聚类中心
+        for j in range(k):
+            # mask: (N,)，属于第 j 簇的样本位置
+            mask = labels == j
+            # 只有非空簇才更新中心
+            if mask.any():
+                # X[mask]: (N_j,D)，均值为 (D,)
+                new_centroids[j] = X[mask].mean(dim=0)
+        # 各坐标变化均不超过 1e-6 时停止
+        if torch.allclose(
+            centroids, new_centroids,
+            rtol=0, atol=1e-6
+        ):
+            centroids = new_centroids
+            break
+        # 更新中心，进入下一轮迭代
+        centroids = new_centroids
+    # 转成坐标元组，保留四位小数
+    return [
+        tuple(round(v, 4) for v in row)
+        for row in centroids.tolist()
+    ]
+```
+
+（B）NumPy 版本（苛刻面试版，推荐背诵）
+
+与 PyTorch 使用完全相同的计算图，不依赖聚类库。
+
+```python
+import numpy as np
+
+def k_means_clustering_numpy(
+    points, k, initial_centroids, max_iterations
+):
+    # X: (N,D)，所有输入数据点
+    X = np.asarray(points, dtype=float)
+    # centroids: (K,D)，当前聚类中心
+    centroids = np.asarray(
+        initial_centroids, dtype=float
+    ).copy()
+    # 最多执行 max_iterations 次迭代
+    for _ in range(max_iterations):
+        # 广播 (N,1,D)-(1,K,D) -> (N,K,D)
+        # 平方求和得到距离矩阵 (N,K)
+        distances = (
+            (X[:, None, :] - centroids[None, :, :]) ** 2
+        ).sum(axis=-1)
+        # labels: (N,)，选择最近中心的编号
+        labels = distances.argmin(axis=1)
+        # 先复制旧中心，避免空簇变成 NaN
+        new_centroids = centroids.copy()
+        # 依次计算每个簇的新中心
+        for j in range(k):
+            # mask: (N,)，选择属于第 j 簇的样本
+            mask = labels == j
+            # 空簇直接保留之前的中心
+            if mask.any():
+                # X[mask]: (N_j,D)，均值为 (D,)
+                new_centroids[j] = X[mask].mean(axis=0)
+        # 检查中心是否已经收敛
+        if np.allclose(
+            centroids, new_centroids,
+            rtol=0, atol=1e-6
+        ):
+            centroids = new_centroids
+            break
+        # 用新中心开始下一轮聚类
+        centroids = new_centroids
+    # 转成元组列表，每个坐标保留四位小数
+    return [
+        tuple(round(v, 4) for v in row)
+        for row in centroids.tolist()
+    ]
+```
+
+最小可运行测试
+
+```python
+# Demo 1：原题样例
+points = [
+    (1, 2), (1, 4), (1, 0),
+    (10, 2), (10, 4), (10, 0)
+]
+initial_centroids = [(1, 1), (10, 1)]
+print(k_means_clustering(
+    points, 2, initial_centroids, 10
+))
+print(k_means_clustering_numpy(
+    points, 2, initial_centroids, 10
+))
+# 两者均输出 [(1.0, 2.0), (10.0, 2.0)]
+
+# Demo 2：重复初始中心，测试空簇
+points = [(0, 0), (0, 0), (10, 10)]
+initial_centroids = [(0, 0), (0, 0), (10, 10)]
+print(k_means_clustering_numpy(
+    points, 3, initial_centroids, 10
+))
+# 输出 [(0.0, 0.0), (0.0, 0.0), (10.0, 10.0)]
+```
+
+上述两个测试都已在 PyTorch 和 NumPy 实现中验证。
+
+4️⃣ Step-by-step Derivation：代码逐步推导
+
+实现前置骨架
+
+```python
+import torch
+
+def k_means_clustering(
+    points, k, initial_centroids, max_iterations
+):
+    pass
+```
+
+Step 1：初始化中心
+
+$$
+X\in\mathbb{R}^{N\times D},\qquad
+C^{(0)}\in\mathbb{R}^{K\times D}
+$$
+
+```python
+X = torch.tensor(points, dtype=torch.float64)
+centroids = torch.tensor(
+    initial_centroids, dtype=torch.float64
+)
+```
+
+`X` 包含所有数据点；`centroids` 保存当前中心。题目已经给定初始中心，因此不需要随机初始化。
+
+Step 2：向量化距离计算（最重要）
+
+$$
+D_{ij}=\sum_{d=1}^{D}(X_{id}-C_{jd})^2
+$$
+
+```python
+distances = (
+    (X[:, None, :] - centroids[None, :, :]) ** 2
+).sum(dim=-1)
+labels = distances.argmin(dim=1)
+```
+
+这里考察 Broadcasting：
+
+每个样本与每个中心按特征维计算平方距离，最后得到 N×K 距离矩阵。
+
+具体来说：
+
+- `X[:, None, :]`：$(N,D)\rightarrow(N,1,D)$。
+- `centroids[None, :, :]`：$(K,D)\rightarrow(1,K,D)$。
+- 相减后广播得到 $(N,K,D)$。
+- `sum(dim=-1)`：沿最后一维求和，得到 $(N,K)$。
+- `argmin(dim=1)`：每个样本取距离最小的中心索引，得到 $(N,)$。
+
+注意 `argmin` 默认在距离相同时选最小索引。
+
+Step 3：更新中心
+
+$$
+\mu_j^{new}=
+\frac{1}{N_j}\sum_{i:z_i=j}x_i
+$$
+
+```python
+new_centroids = centroids.clone()
+for j in range(k):
+    mask = labels == j
+    if mask.any():
+        new_centroids[j] = X[mask].mean(dim=0)
+```
+
+`mask` 是形状 $(N,)$ 的布尔数组。`X[mask]` 只保留第 $j$ 簇的样本，形状为 $(N_j,D)$，沿 `dim=0` 求均值得到 $(D,)$，即新的中心。
+
+**为什么要 `if mask.any()`？** 如果某个簇没有样本，直接计算均值会产生 `NaN`。因此只更新非空簇，空簇保留旧中心。
+
+Step 4：收敛判断
+
+$$
+\boxed{
+\max_{j,d}
+|C_{jd}^{new}-C_{jd}^{old}|
+\leq 10^{-6}
+}
+$$
+
+```python
+if torch.allclose(
+    centroids, new_centroids,
+    rtol=0, atol=1e-6
+):
+    centroids = new_centroids
+    break
+centroids = new_centroids
+```
+
+所有中心坐标变化都足够小时提前停止。若没有提前收敛，最多执行 `max_iterations` 次。
+
+Step 5：返回结果
+
+$$
+C_{\text{output}}
+=\operatorname{round}(C_{\text{final}},4)
+$$
+
+```python
+return [
+    tuple(round(v, 4) for v in row)
+    for row in centroids.tolist()
+]
+```
+
+`tolist()` 将 $(K,D)$ Tensor 转成 Python 嵌套列表；逐行转换成元组后，输出就是题目要求的 `list[tuple]`。
+
+5️⃣ 复杂度与面试高频追问
+
+设 $N$ 为样本数，$K$ 为聚类数量，$D$ 为特征维度，$T$ 为实际迭代次数。
+
+- **时间复杂度：** $O(TNKD)$。每次计算距离和更新中心都需要处理数据。
+- **空间复杂度：** $O(NKD)$。当前实现通过 Broadcasting 创建了 $(N,K,D)$ 中间张量。
+
+常见的进阶追问：
+
+| 面试追问                       | 核心回答                                                     |
+| ------------------------------ | ------------------------------------------------------------ |
+| 为什么不用 `sqrt`？            | 平方距离与欧氏距离有相同的最小值位置                         |
+| 如何处理 Empty Cluster？       | 保留旧中心，或者重新初始化                                   |
+| K-Means 一定收敛到全局最优吗？ | 不一定，通常只能保证到局部最优                               |
+| 怎么改进初始化？               | K-Means++                                                    |
+| 数据特别大怎么办？             | Mini-Batch K-Means，或者分批计算距离                         |
+| 如何优化 Broadcasting 内存？   | 利用 $\\|x-c\\|^2=\\|x\\|^2+\\|c\\|^2-2x^\top c$，将中间内存降至 $O(NK)$ |
+
+**面试最重要的三行 NumPy 代码：**
+
+```python
+# 1. 计算所有样本到所有中心的平方距离
+distances = ((X[:, None, :] - centroids[None, :, :]) ** 2).sum(axis=-1)
+# 2. 分配每个样本的聚类标签
+labels = distances.argmin(axis=1)
+# 3. 更新第 j 个非空簇的中心
+centroids[j] = X[labels == j].mean(axis=0)
+```
+
+掌握这三行，再补充迭代、收敛和空簇判断，就覆盖了经典 K-Means ML Coding 的核心实现。
+
+
+
 #### ▍第一部分 · 主文档原有题目
 
 > [跳转到通用概率版 BCE](#probability-bce)
@@ -67,7 +412,7 @@ import torch
 
 def softmax(x, dim=-1):
     # x: (..., C) -> 同形状概率，沿 dim 归一化
-    x = x - x.max(dim=dim, keepdim=True).values # (...,1) 广播回 (...,C)：减 max 防 exp 上溢
+    x = x - x.max(dim=dim, keepdim=True).values # ⚠️ 减 max 防 exp 上溢  ‼️ values‼️
     exp_x = torch.exp(x)
     return exp_x / exp_x.sum(dim=dim, keepdim=True)  # 沿 dim 求和得 (...,1)，广播相除
 ```
@@ -391,7 +736,7 @@ class LayerNorm(nn.Module):
     def forward(self, x):
         # x: (..., d_model) -> 同形状
         mean = x.mean(-1, keepdim=True)                # 沿特征维聚合: (...,D) -> (...,1)
-        var = x.var(-1, keepdim=True, unbiased=False)  # 有偏方差（除 D），同为 (...,1)
+        var = x.var(-1, keepdim=True, unbiased=False)  # 有偏方差（除 D），同为 (...,1) 
         x_hat = (x - mean) / torch.sqrt(var + self.eps)  # (...,1) 广播回 (...,D)：逐 token 标准化
         return self.gamma * x_hat + self.beta          # (D,) 广播到 (...,D)，逐通道缩放平移
 ```
@@ -442,7 +787,57 @@ def layernorm(x, gamma, beta, eps=1e-5): pass   # x:(...,D)，gamma/beta:(D,) ->
 
 #### 👀 MHA（Multi-Head Attention，含/不含 mask）
 
-#### 👀 MultiHeadAttention
+
+灵光一闪，突然觉得MHA 最容易忘的这一串操作：
+view/reshape → transpose → attention → transpose → view/reshape
+	
+刚好可以压缩成：
+VTATV
+	
+V = View / reshape
+T = Transpose
+A = Attention
+	
+重新断了个句那就是：
+V | TAT | V
+	
+TAT，不就是一个哭脸吗！😭
+	
+两边两个 V 再换成两只手：
+✋😭🤚
+真的很像一个被 MHA 逼到哭着举手投降的人（正是我自己
+	
+对应的 shape flow就是：
+	
+(batch_size, seq_len, d_model)
+	
+→ view/reshape 把d_model展开
+	
+(batch_size, seq_len, num_heads, head_dim)
+	
+→ transpose 把num_heads取出来
+	
+(batch_size, num_heads, seq_len, head_dim)
+	
+→ attention
+	
+(batch_size, num_heads, seq_len, head_dim)
+	
+→ transpose 把num_heads放回去
+	
+(batch_size, seq_len, num_heads, head_dim)
+	
+→ view/reshape 把d_model还原，和input一致
+(batch_size, seq_len, d_model)
+	
+而Attention 本身是好记的：
+QKᵀ / √head_dim → mask → softmax over keys → attention @ V
+	
+于是现在，我脑子里的 MHA 已经压缩成：
+QKV → ✋😭🤚 → out_proj
+	
+下次面试再让我手写 MHA，希望脑子空白的那一秒里，先出现这个投降哭泣小人：
+
 ```py
 import math
 import torch
@@ -454,8 +849,6 @@ class MultiHeadAttention(nn.Module):
     """
     普通通用 MHA：
     forward(q_source, k_source, v_source, attn_mask=None)
-
-    适用：
     1. Self-Attention:
        q_source = k_source = v_source = x
     2. Cross-Attention:
@@ -518,7 +911,6 @@ class MultiHeadAttention(nn.Module):
         q_source: (B, S_q, D)
         k_source: (B, S_k, D)
         v_source: (B, S_k, D)
-
         attn_mask:
         - None，表示不 mask
         - 或 shape 可 broadcast 到 (B, H, S_q, S_k)
@@ -530,13 +922,10 @@ class MultiHeadAttention(nn.Module):
 
         # q: (B, S_q, D) -> (B, H, S_q, d_head)
         q = self._split_heads(self.W_q(q_source))
-
         # k: (B, S_k, D) -> (B, H, S_k, d_head)
         k = self._split_heads(self.W_k(k_source))
-
         # v: (B, S_k, D) -> (B, H, S_k, d_head)
         v = self._split_heads(self.W_v(v_source))
-
         # k.transpose(-2, -1): (B, H, d_head, S_k)
         # scores: (B, H, S_q, S_k)
         # 作用：每个 query token 对每个 key token 打分
@@ -546,7 +935,7 @@ class MultiHeadAttention(nn.Module):
 
         if attn_mask is not None:
             # attn_mask broadcast 到 scores
-            # True 的位置被置为 -inf，softmax 后概率接近 0
+            # ‼️ masked_fill() 是 PyTorch 中的条件填充操作 ；True 的位置被置为 -inf，softmax 后概率接近 0
             scores = scores.masked_fill(
                 attn_mask, float("-inf")
             )
@@ -563,6 +952,13 @@ class MultiHeadAttention(nn.Module):
         out = self._merge_heads(attn)
 
         return self.W_o(out)
+      
+      
+output = attention(
+    q_source=x,
+    k_source=x,
+    v_source=x
+)
 ```
 #### 👀 DecoderSelfAttentionWithKVCache
 
@@ -1356,7 +1752,7 @@ $$
 （ii）`out = out.transpose(1,2).reshape(B, -1, D); return self.Wo(out)`
 （iii）拼接 head 维度，最后过 $$W_O$$ 融合不同 head 的信息。
 
-#### 👀 MHA + KV Cache
+#### 👀 ‼️MHA + KV Cache
 
 自回归解码时只输入新 token，把历史 K/V 缓存复用，避免每步重算前面所有位置。核心对象：cache 中拼接的 $$K_{\text{cache}}, V_{\text{cache}}$$，以及带 cache offset 的 causal mask。
 
@@ -1373,6 +1769,140 @@ $$
 prefill 时 `T_new > 1`，必须加 causal mask 防止当前位置看到未来 token；单 token decode 时 `T_new=1`，同一套 offset mask 会自然退化为“所有已有 KV 都可见”。
 
 #### （A）PyTorch 版本
+
+<span style="color:red">...</span>
+
+<span style="color:red">普通 Causal Mask：`diagonal=1`。有 KV Cache：在 1 上加历史长度。</span>
+
+<span style="color:red">**`x.shape()` ❌ → `x.shape` ✅，因为 `shape` 是属性，不是函数。**</span>
+
+<span style="color:red">**_merge 中 transpose() 后需要 .contiguous()，才能安全地使用 .view()**</span>
+
+
+
+MHA + KV Cache 面试错误汇总表
+
+| 分类           | 之前的错误 / 疑问                      | 正确写法 / 理解                                          | 原因                                  |
+| -------------- | -------------------------------------- | -------------------------------------------------------- | ------------------------------------- |
+| 类定义         | `class attentionwithcache:`            | `class attentionwithcache(nn.Module):`                   | PyTorch 模型需要继承 `nn.Module`      |
+| 初始化         | 忘记 `super().__init__()`              | `super().__init__()`                                     | 正确初始化模块                        |
+| 初始化参数     | `__init__(self, x, num_head, d_model)` | `__init__(self, num_head, d_model)`                      | `x` 是 forward 的输入                 |
+| Head 数量      | 没检查能否整除                         | `assert d_model % num_head == 0`                         | 保证每个 Head 维度为整数              |
+| 实例属性       | `num_head`, `d_head`                   | `self.num_head`, `self.d_head`                           | 要访问 `__init__` 中保存的属性        |
+| Shape API      | `x.shape()`                            | `x.shape`                                                | `shape` 是属性，不是函数              |
+| Shape API      | `q.shape(2)`                           | `q.size(2)` 或 `q.shape[2]`                              | `shape` 不能像函数一样调用            |
+|                |                                        |                                                          |                                       |
+| Linear         | 以为必须写 `Wq * x`                    | `self.Wq(x)`                                             | `nn.Linear` 执行 $xW^T+b$             |
+| Linear         | 以为 Linear 会转置输入                 | `nn.Linear(512,256)`                                     | 只将最后一维从 512 映射到 256         |
+| Split          | `view(B,H,S,d).transpose(1,2)`         | `view(B,S,H,d).transpose(1,2)`                           | 必须先拆特征维，再交换 Head 和序列维  |
+| Merge          | `transpose(1,2).view(...)`             | `transpose(1,2).contiguous().view(...)`                  | 转置后通常需要连续内存布局            |
+| KV 判断        | `kv_cache["k"] not None`               | `kv_cache["k"] is not None`                              | 判断 None 必须使用 `is`               |
+| KV 判断        | 直接访问 `kv_cache["k"]`               | `kv_cache is not None and kv_cache.get("k") is not None` | 避免空缓存或不存在的 Key              |
+|                |                                        | import torch.nn.functional as F                          |                                       |
+| KV 拼接        | 忘了API格式`cat(...,dim=2)`            | `torch.cat([old_k,k],dim=2)`                             | `(B,H,T,d)` 的第 2 维是时间维         |
+| Cache 保存     | 把 `new_cache` 放进 `if`               | 放在 `if` 外                                             | 第一次调用也必须生成 Cache            |
+| Cache 保存     | `kv_cache["k"]=k`                      | `new_cache={"k":k,"v":v}`                                | `kv_cache=None` 时无法赋值            |
+| 长度变量       | 把 `q.size(2)` 当作历史长度            | `T_new=q.size(2)`                                        | Q 只包含新增 Token                    |
+| 长度变量       | 在拼接 K 之前计算 `T_total`            | 拼接后 `T_total=k.size(2)`                               | K 拼接后才包含历史 Token              |
+| 长度变量       | 把 `T_total-T_new` 当作新长度          | `past_len=T_total-T_new`                                 | 差值是历史 Token 数                   |
+| Matmul         | `k.transpose()`                        | `k.transpose(-2,-1)`                                     | 交换最后两个维度                      |
+| Matmul         | 混淆 `*`、`@`、`matmul`                | `@` 和 `matmul` 是矩阵乘法                               | `*` 是逐元素乘法                      |
+| Score 缩放     | `//sqrt(d_head)`                       | `/ math.sqrt(self.d_head)`                               | `//` 是向下取整除法                   |
+| Mask 创建      | `dtype=bool`                           | `dtype=torch.bool`                                       | 参数拼写错误                          |
+| Mask 形状      |                                        | `ones(T_new,T_total)`                                    | 形状和attention最后两层一样（广播）   |
+| Mask 设备      | `torch.ones(...)` 未指定设备           | `device=x.device`                                        | 防止 Mask 在 CPU、Scores 在 GPU       |
+| Mask 规则      | 不理解 `diagonal=1`                    | 从主对角线上方第一条对角线开始保留                       | `triu` 的偏移规则                     |
+| Mask 规则      | `diagonal=T_new+1`                     | `diagonal=past_len+1`                                    | 历史长度决定偏移，`+1` 允许看到自己   |
+| Mask 含义      | 混淆 0 和 1                            | `True/1` 为遮挡                                          | 与 `masked_fill(mask,-inf)` 配合      |
+| Mask API       | `torch.mask_fill(...)`                 | `score.masked_fill(mask,-inf)`                           | 正确的方法名是 `masked_fill`          |
+| Mask 值        | `float("inf")`                         | `float("-inf")`                                          | Softmax 后被屏蔽位置权重为 0          |
+| Softmax        | 直接 `score @ v`                       | `att=F.softmax(score,dim=-1)`                            | 需要先把 Score 归一化为权重           |
+| Attention 输出 | `att @ v.transpose(-2,-1)`             | `att @ v`                                                | V 不需要转置                          |
+| 输出投影       | `return out`                           | `return self.Wo(out),new_cache`                          | 完整 MHA 包含输出投影，并需返回 Cache |
+
+最容易混淆的 5 个公式
+
+① Head 维度
+
+$$
+d_{\text{head}}=\frac{d_{\text{model}}}{H}
+$$
+
+---
+
+② 历史、新增、总长度
+
+$$
+T_{\text{total}}=past\_len+T_{\text{new}}
+$$
+
+---
+
+③ Attention Score
+
+$$
+Scores=\frac{QK^T}{\sqrt{d_{\text{head}}}}
+$$
+
+---
+
+④ KV Cache 的因果 Mask 偏移
+
+$$
+diagonal=past\_len+1
+$$
+
+---
+
+⑤ Attention 输出
+
+$$
+Output=\operatorname{Softmax}(MaskedScores)V
+$$
+
+
+
+```python
+# 1. QKV Projection + Split
+q = self._split(self.Wq(x))
+k = self._split(self.Wk(x))
+v = self._split(self.Wv(x))
+
+# 2. KV Cache
+T_new = q.size(2)
+
+if kv_cache is not None and kv_cache.get("k") is not None:
+    k = torch.cat([kv_cache["k"], k], dim=2)
+    v = torch.cat([kv_cache["v"], v], dim=2)
+
+new_cache = {"k": k, "v": v}
+
+# 3. Length
+T_total = k.size(2)
+past_len = T_total - T_new
+
+# 4. Attention Scores
+scores = q @ k.transpose(-2, -1) / math.sqrt(self.d_head)
+
+# 5. Causal Mask
+mask = torch.triu(
+    torch.ones(T_new, T_total, device=x.device, dtype=torch.bool),
+    diagonal=past_len + 1
+)
+
+scores = scores.masked_fill(mask, float("-inf"))
+
+# 6. Softmax + Value
+attn = F.softmax(scores, dim=-1)
+out = attn @ v
+
+# 7. Merge + Output Projection
+out = self.Wo(self._merge(out))
+
+return out, new_cache
+```
+
+
 
 ```python
 import math
@@ -1412,17 +1942,17 @@ class MHAWithKVCache(nn.Module):
             past_len = kv_cache["k"].size(2)           # cache 的时间维长度
             K = torch.cat([kv_cache["k"], K], dim=2)  # 沿时间维拼: (B,H,T_total,d_k)，历史在前
             V = torch.cat([kv_cache["v"], V], dim=2)
-        new_cache = {"k": K, "v": V}                   # 含历史+新增，供下一步复用
+        new_cache = {"k": K, "v": V}                   # 应该放在 if 外面。  原因是：无论之前有没有 KV Cache，本次都需要生成新的 Cache
 
         # Q @ K^T: (B,H,T_new,d_k) @ (B,H,d_k,T_total)
         # -> scores: (B,H,T_new,T_total)
         scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.head_dim)
-
-        # cache-aware causal mask: query i 的绝对位置是 past_len + i
+        # 注意 T_total = past_len + T_new 
         T_new, T_total = Q.size(2), K.size(2)          # 本步 query 数 / 全部可见 key 数
-        mask = torch.triu(                             # (T_new,T_total) bool，True = 需屏蔽的未来位置
-            torch.ones(T_new, T_total, device=x.device, dtype=torch.bool),
-            diagonal=past_len + 1,                     # 偏移 past_len 使 query i 只能看到 key <= past_len+i
+        #  True = 需屏蔽的未来位置 1（True）= 遮挡，不能关注该 Token # ‼️ triu = Triangular Upper（上三角矩阵）。T_new, T_total Mask 的形状必须和 Attention Scores 的最后两个维度一致 ‼️ device：PyTorch 要求参与 masked_fill() 运算的 scores 和 mask 位于同一个设备（Device）上。因为 torch.ones() 是凭空创建一个新 Tensor，而其他操作大多是基于已有 Tensor 计算，所以不需要重新指定 Device。
+         mask = torch.triu( 
+            torch.ones(T_new, T_total, device=x.device, dtype=torch.bool), 
+            diagonal=past_len + 1,                     # ‼️ 偏移 past_len 使 query i 只能看到 key <= past_len+i
         )
         scores = scores.masked_fill(mask, float("-inf"))  # (T_new,T_total) 广播到 (B,H,T_new,T_total)
 
@@ -1431,7 +1961,14 @@ class MHAWithKVCache(nn.Module):
         return self.Wo(out), new_cache
 ```
 
-#### （B）NumPy 版本
+
+
+Q.shape = (2, 8, 3, 64)(新增)
+K.shape = (2, 8, 7, 64)(total)
+
+torch.ones(T_new, T_total,...)
+
+#### B）NumPy 版本
 
 ```python
 import numpy as np
@@ -2596,6 +3133,7 @@ class RMSNorm(nn.Module):
         x_f = x.float()
         rms_inv = torch.rsqrt(x_f.square().mean(-1, keepdim=True) + self.eps)
         return self.weight * (x_f * rms_inv).to(dtype)  # γ:(D,) 广播到 (...,D)，shape 不变
+
 ```
 
 #### （B）NumPy 版本
@@ -2644,6 +3182,12 @@ $$
 
 #### （A）PyTorch 版本
 
+![Screenshot 2026-11-02 at 20.26.39](./assets/Screenshot%202026-11-02%20at%2020.26.39.png)
+
+
+
+![Screenshot 2026-11-02 at 20.34.18](./assets/Screenshot%202026-11-02%20at%2020.34.18.png)
+
 ```python
 import math
 import torch
@@ -2680,6 +3224,90 @@ class GQA(nn.Module):
         out = out.transpose(1, 2).contiguous().view(B, T, -1)  # 合头 -> (B,T,H*d_k)=(B,T,D)
         return self.Wo(out)                            # (B,T,D)
 ```
+
+```py
+
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class GQA(nn.Module):
+    def __init__(self, d_model, num_heads, num_kv_heads):
+        super().__init__()
+
+        assert d_model % num_heads == 0
+
+        # ⭐【GQA 不同 1】要求 Q head 数能被 KV head 数整除
+        # MHA: H = G，不需要单独分组
+        # GQA: G < H，多个 Q head 共享一个 KV head
+        assert num_heads % num_kv_heads == 0
+
+        self.num_heads = num_heads
+
+        # ⭐【GQA 不同 2】新增 num_kv_heads
+        # MHA: num_kv_heads = num_heads
+        # GQA: num_kv_heads < num_heads
+        self.num_kv_heads = num_kv_heads
+
+        self.head_dim = d_model // num_heads
+
+        # ⭐【GQA 不同 3】新增 repeat，表示一个 KV head 服务多少个 Q head
+        # 例如 H=8, G=2 -> repeat=4
+        self.repeat = num_heads // num_kv_heads
+
+        # 与 MHA 相同：Q 仍然有 H 个 head
+        self.Wq = nn.Linear(d_model, d_model)
+
+        # ⭐【GQA 不同 4】K/V 投影维度缩小
+        # MHA: Linear(D, D) -> H * d_k
+        # GQA: Linear(D, G * d_k)
+        self.Wk = nn.Linear(d_model, num_kv_heads * self.head_dim)
+        self.Wv = nn.Linear(d_model, num_kv_heads * self.head_dim)
+
+        self.Wo = nn.Linear(d_model, d_model)
+
+    def forward(self, x):
+        B, T, _ = x.shape
+
+        # 与 MHA 相同：Q -> (B,H,T,d_k)
+        Q = self.Wq(x).view(
+            B, T, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+
+        # ⭐【GQA 不同 5】K/V 只有 G 个 head，而不是 H 个
+        # MHA: (B,H,T,d_k)
+        # GQA: (B,G,T,d_k)
+        K = self.Wk(x).view(
+            B, T, self.num_kv_heads, self.head_dim
+        ).transpose(1, 2)
+        V = self.Wv(x).view(
+            B, T, self.num_kv_heads, self.head_dim
+        ).transpose(1, 2)
+
+        # ⭐【GQA 不同 6】核心区别：复制 K/V head
+        # MHA: 不需要这两行
+        # GQA: 每个 KV head 复制 repeat 次
+        # (B,G,T,d_k) -> (B,H,T,d_k)
+        K = K.repeat_interleave(self.repeat, dim=1)
+        V = V.repeat_interleave(self.repeat, dim=1)
+
+        # 以下与普通 MHA 完全相同
+        scores = torch.matmul(
+            Q, K.transpose(-2, -1)
+        ) / math.sqrt(self.head_dim)  # (B,H,T,T)
+
+        attn = F.softmax(scores, dim=-1)
+        out = torch.matmul(attn, V)  # (B,H,T,d_k)
+        out = out.transpose(1, 2).contiguous().view(B, T, -1)
+
+        return self.Wo(out)  # (B,T,D)
+
+```
+
+
+
+
 
 #### （B）NumPy 版本
 
@@ -2759,7 +3387,45 @@ class LoRALinear(nn.Module):
         # x: (..., in_dim) -> (..., out_dim)
         # 冻结主干输出 + 低秩增量：x@A 先降到 r 维，再 @B 升回 out_dim
         return self.linear(x) + self.scale * (x @ self.A @ self.B)
+      
+      
 ```
+
+```py
+import torch
+import torch.nn as nn
+
+class LoRALinear(nn.Module):
+    def __init__(self, weight, rank=4, alpha=8):
+        super().__init__()
+        # weight: (d_in, d_out)，预训练权重
+        d_in, d_out = weight.shape
+        # 冻结原始权重 W0
+        self.W0 = nn.Parameter(
+            weight.clone(), requires_grad=False
+        )
+        # A: (d_in, r)，随机小值初始化
+        self.A = nn.Parameter(
+            torch.randn(d_in, rank) * 0.01
+        )
+        # B: (r, d_out)，初始化为零
+        self.B = nn.Parameter(
+            torch.zeros(rank, d_out)
+        )
+        # LoRA 缩放系数
+        self.scale = alpha / rank
+
+    def forward(self, x):
+        # x: (N, d_in)
+        # h: (N, r)，降维投影
+        h = x @ self.A
+        # delta: (N, d_out)，低秩增量
+        delta = h @ self.B
+        # 合并原始输出与 LoRA 输出
+        return x @ self.W0 + self.scale * delta
+```
+
+
 
 #### （B）NumPy 版本（推理前向）
 
@@ -3083,6 +3749,127 @@ O=AV
 $$
 
 K/V 在 head 维为 1，通过 broadcasting 与 $$H$$ 个 Q-head 计算 attention。
+
+
+
+#### **模拟题目：Implement Linear Regression Using NumPy and Gradient Descent**
+
+给定训练数据 $X$ 和目标值 $y$，只使用 NumPy，从零实现一个线性回归模型，并使用 Batch Gradient Descent 训练参数。
+
+要求支持多个输入特征、独立的权重 $w$ 与偏置 $b$、MSE Loss、指定学习率和迭代次数，最后返回训练后的模型参数及 Loss 历史，并证明 Loss 下降。
+
+建议练习函数签名（自行设定，非官方接口）
+
+`fit_linear_regression(X, y, lr, steps) -> (w, b, losses)`
+
+设 $X$ 有 $N$ 个样本、$D$ 个特征：
+
+预测：
+
+$$
+\hat y=Xw+b
+$$
+
+均方误差：
+
+$$
+L=\frac{1}{N}\sum_{i=1}^{N}(\hat y_i-y_i)^2
+$$
+
+对权重求梯度：
+
+$$
+\frac{\partial L}{\partial w}
+=\frac{2}{N}X^\top(\hat y-y)
+$$
+
+对偏置求梯度：
+
+$$
+\frac{\partial L}{\partial b}
+=\frac{2}{N}\sum_{i=1}^{N}(\hat y_i-y_i)
+$$
+
+然后更新：
+
+$$
+w\leftarrow w-\alpha\frac{\partial L}{\partial w}
+$$
+
+$$
+b\leftarrow b-\alpha\frac{\partial L}{\partial b}
+$$
+
+其中 $\alpha$ 是学习率。
+
+
+
+```python
+import numpy as np
+
+def train_step(X, y, w, b, lr):
+    # X: (N, D)
+    # y: (N,)
+    # w: (D,)
+    # b: scalar
+
+    n = X.shape[0]
+
+    # Step 1: Forward
+    y_pred = X @ w + b           # (N,)
+
+    # Step 2: MSE Loss
+    error = y_pred - y           # (N,)
+    loss = np.mean(error ** 2)   # scalar
+
+    # Step 3: Gradients
+    dw = (2.0 / n) * (X.T @ error)  # (D,)
+    db = (2.0 / n) * np.sum(error)  # scalar
+
+    # Step 4: Update
+    w = w - lr * dw
+    b = b - lr * db
+
+    return w, b, float(loss)
+
+def fit_linear_regression(X, y, lr=0.05, steps=2000):
+    X = np.asarray(X, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+
+    if X.ndim != 2 or X.shape[0] == 0:
+        raise ValueError("X must be a non-empty 2D array")
+    if len(y) != X.shape[0]:
+        raise ValueError("X and y must have same N")
+
+    n, d = X.shape
+
+    # Initialize
+    w = np.zeros(d)
+    b = 0.0
+    losses = []
+
+    # Training loop
+    for _ in range(steps):
+        w, b, loss = train_step(X, y, w, b, lr)
+        losses.append(loss)
+
+    return w, b, losses
+
+# Test case
+X = np.array([[1.0], [2.0], [3.0], [4.0]])
+y = np.array([3.0, 5.0, 7.0, 9.0])
+
+w, b, losses = fit_linear_regression(X, y)
+
+print("w:", w)
+print("b:", b)
+print("Initial loss:", losses[0])
+print("Final loss:", losses[-1])
+```
+
+这段代码已经用示例数据实际计算验证：
+
+
 
 ##### 3️⃣ Implementation Blocks
 
